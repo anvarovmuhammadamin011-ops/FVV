@@ -9,7 +9,7 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/api': { target: BACKEND, changeOrigin: true },
+      '/api': { target: BACKEND, changeOrigin: true, ws: true },
       '/uploads': { target: BACKEND, changeOrigin: true }
     }
   }

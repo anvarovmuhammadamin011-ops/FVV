@@ -1,7 +1,8 @@
-import { createContext, useContext, useState, useCallback, useRef } from 'react';
+import { createContext, useContext, useState, useCallback, useRef, useEffect } from 'react';
 import { DISTRICTS, USERS, districtNameById, APP_VERSION } from './constants.js';
 import { load, save, removeStored, todayStr } from './utils.js';
 import { apiFetch, getToken, setToken, isOfflineMode } from './api.js';
+import { startRealtime, stopRealtime } from './realtime.js';
 
 const AppContext = createContext(null);
 export function useApp() { return useContext(AppContext); }
@@ -81,6 +82,14 @@ export function AppProvider({ children }) {
       throw err;
     }
   }, []);
+
+  // Realtime: login bo'lgach WS orqali serverdagi o'zgarishlarni kuzatamiz.
+  // Server 'sync' signalini yuborganda ma'lumotlar qayta yuklanadi.
+  useEffect(() => {
+    if (!session || !getToken() || isOfflineMode()) return undefined;
+    startRealtime(() => { syncRemoteState().catch(() => { /* ignore */ }); });
+    return () => stopRealtime();
+  }, [session, syncRemoteState]);
 
   const doLogin = useCallback(async (districtId, rawUser, rawPass) => {
     const u = (rawUser || '').trim().toLowerCase();

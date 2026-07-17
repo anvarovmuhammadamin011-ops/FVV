@@ -567,6 +567,218 @@ function cleanupSessions() {
 }
 
 // ---------------------------------------------------------------------------
+// Realtime (WebSocket, RFC 6455 — zero-dep)
+//
+// Protokol (server -> client push, client faqat auth yuboradi):
+//   1) Client `/api/ws` ga ulanadi (token URL'da EMAS — access log'ga tushmasin).
+//   2) Client birinchi xabar sifatida {type:'auth', token} yuboradi.
+//   3) Server sessiyani tekshiradi: OK -> {type:'ready'}; xato -> close(4001).
+//   4) Ma'lumot o'zgarganda server {type:'sync', topic, district} yuboradi —
+//      client o'z scope'i bilan qayta fetch qiladi (WS orqali data yuborilmaydi,
+//      shuning uchun scope-leak xavfi yo'q).
+// ---------------------------------------------------------------------------
+const WS_MAGIC = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+const WS_CLOSE_AUTH_FAILED = 4001;
+const WS_MAX_FRAME_BYTES = 64 * 1024; // client faqat auth yuboradi — katta frame shubhali
+const WS_AUTH_TIMEOUT_MS = 30 * 1000;
+const wsClients = new Set(); // { socket, session|null, alive, buffer, connectedAt }
+
+function wsAcceptKey(key) {
+  return crypto.createHash('sha1').update(key + WS_MAGIC).digest('base64');
+}
+
+function wsEncodeFrame(opcode, payload = Buffer.alloc(0)) {
+  const len = payload.length;
+  let header;
+  if (len < 126) {
+    header = Buffer.from([0x80 | opcode, len]);
+  } else if (len < 65536) {
+    header = Buffer.alloc(4);
+    header[0] = 0x80 | opcode;
+    header[1] = 126;
+    header.writeUInt16BE(len, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = 0x80 | opcode;
+    header[1] = 127;
+    header.writeBigUInt64BE(BigInt(len), 2);
+  }
+  return Buffer.concat([header, payload]);
+}
+
+function wsWrite(client, frame) {
+  if (client.socket.destroyed) return;
+  client.socket.write(frame, error => {
+    if (error) wsDestroy(client);
+  });
+}
+
+function wsSendJson(client, obj) {
+  wsWrite(client, wsEncodeFrame(0x1, Buffer.from(JSON.stringify(obj))));
+}
+
+function wsClose(client, code) {
+  if (wsClients.has(client)) {
+    wsClients.delete(client);
+    let payload = Buffer.alloc(0);
+    if (code) {
+      payload = Buffer.alloc(2);
+      payload.writeUInt16BE(code, 0);
+    }
+    try { client.socket.end(wsEncodeFrame(0x8, payload)); } catch { /* ignore */ }
+  }
+  // end() dan keyin javob kutmaymiz — qisqa muddat ichida uziladi
+  setTimeout(() => wsDestroy(client), 1000).unref();
+}
+
+function wsDestroy(client) {
+  wsClients.delete(client);
+  try { client.socket.destroy(); } catch { /* ignore */ }
+}
+
+// Kelgan baytlar oqimidan frame'larni ajratish. Client frame'lari doim masked
+// (RFC 6455 5.1). Faqat kichik boshqaruv/auth xabarlari kutiladi.
+function wsOnData(client, chunk) {
+  client.buffer = Buffer.concat([client.buffer, chunk]);
+
+  while (true) {
+    const buf = client.buffer;
+    if (buf.length < 2) return;
+
+    const fin = (buf[0] & 0x80) !== 0;
+    const opcode = buf[0] & 0x0f;
+    const masked = (buf[1] & 0x80) !== 0;
+    let payloadLen = buf[1] & 0x7f;
+    let offset = 2;
+
+    if (payloadLen === 126) {
+      if (buf.length < 4) return;
+      payloadLen = buf.readUInt16BE(2);
+      offset = 4;
+    } else if (payloadLen === 127) {
+      if (buf.length < 10) return;
+      const big = buf.readBigUInt64BE(2);
+      if (big > BigInt(WS_MAX_FRAME_BYTES)) return wsDestroy(client);
+      payloadLen = Number(big);
+      offset = 10;
+    }
+
+    if (payloadLen > WS_MAX_FRAME_BYTES) return wsDestroy(client);
+    const maskLen = masked ? 4 : 0;
+    if (buf.length < offset + maskLen + payloadLen) return; // to'liq kelmagan
+
+    let payload = buf.subarray(offset + maskLen, offset + maskLen + payloadLen);
+    if (masked) {
+      const mask = buf.subarray(offset, offset + 4);
+      const unmasked = Buffer.allocUnsafe(payloadLen);
+      for (let i = 0; i < payloadLen; i++) unmasked[i] = payload[i] ^ mask[i % 4];
+      payload = unmasked;
+    }
+    client.buffer = buf.subarray(offset + maskLen + payloadLen);
+
+    if (opcode === 0x8) return wsClose(client);                       // close
+    if (opcode === 0x9) { wsWrite(client, wsEncodeFrame(0xA, payload)); continue; } // ping -> pong
+    if (opcode === 0xA) { client.alive = true; continue; }            // pong
+
+    if (opcode === 0x1) {
+      // Fragmentlangan xabarlar qo'llanmaydi (auth xabari kichik)
+      if (!fin) return wsClose(client);
+      wsHandleTextMessage(client, payload.toString('utf8'));
+      continue;
+    }
+    // Boshqa opcode'lar (binary, continuation) kutilmaydi
+    return wsClose(client);
+  }
+}
+
+function wsHandleTextMessage(client, text) {
+  let message = null;
+  try { message = JSON.parse(text); } catch { /* noto'g'ri format */ }
+
+  if (!client.session) {
+    const token = message && message.type === 'auth' ? String(message.token || '') : '';
+    const session = token ? sessions.get(token) : null;
+    if (!session || session.expiresAt <= Date.now()) {
+      return wsClose(client, WS_CLOSE_AUTH_FAILED);
+    }
+    client.session = session;
+    logger.info({ msg: 'ws_auth_ok', username: session.username, district: session.district, clients: wsClients.size });
+    return wsSendJson(client, { type: 'ready' });
+  }
+  // Auth'dan keyingi client xabarlari protokolda yo'q — jimgina e'tiborsiz
+}
+
+function attachWebSocket(server) {
+  server.on('upgrade', (req, socket) => {
+    try {
+      const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+      const upgradeOk = String(req.headers.upgrade || '').toLowerCase() === 'websocket';
+      const key = req.headers['sec-websocket-key'];
+
+      if (url.pathname !== '/api/ws' || !upgradeOk || !key) {
+        socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+        return socket.destroy();
+      }
+
+      socket.write(
+        'HTTP/1.1 101 Switching Protocols\r\n' +
+        'Upgrade: websocket\r\n' +
+        'Connection: Upgrade\r\n' +
+        `Sec-WebSocket-Accept: ${wsAcceptKey(key)}\r\n\r\n`
+      );
+      socket.setNoDelay(true);
+      socket.setTimeout(0);
+
+      const client = { socket, session: null, alive: true, buffer: Buffer.alloc(0), connectedAt: Date.now() };
+      wsClients.add(client);
+
+      socket.on('data', chunk => {
+        try { wsOnData(client, chunk); } catch (error) {
+          logger.warn({ msg: 'ws_frame_error', err: serializeErr(error) });
+          wsDestroy(client);
+        }
+      });
+      socket.on('close', () => wsClients.delete(client));
+      socket.on('error', () => wsDestroy(client));
+    } catch (error) {
+      logger.warn({ msg: 'ws_upgrade_error', err: serializeErr(error) });
+      try { socket.destroy(); } catch { /* ignore */ }
+    }
+  });
+}
+
+// Ma'lumot o'zgardi — tegishli scope'dagi klientlarga xabar. Viloyat (region)
+// hammasini ko'radi; qolganlar faqat o'z tumanini.
+function broadcastSync(topic, district) {
+  if (!wsClients.size) return;
+  const now = Date.now();
+  for (const client of wsClients) {
+    const session = client.session;
+    if (!session) continue; // hali auth qilmagan
+    if (session.expiresAt <= now) { wsClose(client, WS_CLOSE_AUTH_FAILED); continue; }
+    if (district && session.role !== 'region' && session.district !== district) continue;
+    wsSendJson(client, { type: 'sync', topic, district: district || null });
+  }
+}
+
+function closeAllWebSockets() {
+  for (const client of wsClients) wsDestroy(client);
+}
+
+// O'lik ulanishlarni tozalash: 30s da ping; pong kelmasa uziladi.
+// Auth qilmagan ulanishlar ham muddat o'tgach yopiladi.
+const wsHeartbeatTimer = setInterval(() => {
+  const now = Date.now();
+  for (const client of wsClients) {
+    if (!client.session && client.connectedAt + WS_AUTH_TIMEOUT_MS <= now) { wsClose(client); continue; }
+    if (!client.alive) { wsDestroy(client); continue; }
+    client.alive = false;
+    wsWrite(client, wsEncodeFrame(0x9));
+  }
+}, 30 * 1000);
+wsHeartbeatTimer.unref();
+
+// ---------------------------------------------------------------------------
 // Scope filtrlari
 // ---------------------------------------------------------------------------
 function filterChecksByScope(checks, session, date) {
@@ -717,6 +929,7 @@ async function handleCreateGoal(req, res, session) {
   };
   db.goals.push(goal);
   writeDb(db);
+  broadcastSync('goals', session.district);
   sendJson(res, 201, { goal });
 }
 
@@ -786,6 +999,7 @@ async function handleCreateCheck(req, res, session) {
   }
 
   writeDb(db);
+  broadcastSync('checks', session.district);
   sendJson(res, 201, { check });
 }
 
@@ -871,6 +1085,7 @@ async function handleUpdateCheck(req, res, session, checkId) {
   }
 
   writeDb(db);
+  broadcastSync('checks', session.district);
   sendJson(res, 200, { check: db.checks[index] });
 }
 
@@ -893,6 +1108,7 @@ async function handleCreateFaultType(req, res, session) {
   };
   db.faultTypes.push(newFault);
   writeDb(db);
+  broadcastSync('faultTypes', session.district);
   sendJson(res, 201, { faultType: newFault });
 }
 
@@ -967,7 +1183,7 @@ async function route(req, res) {
   if (req.method === 'PUT' && url.pathname === '/api/goals/complete') {
     const db = readDb();
     const goal = db.goals.find(g => g.worker === session.username && g.district === session.district && !g.completed);
-    if (goal) { goal.completed = true; writeDb(db); }
+    if (goal) { goal.completed = true; writeDb(db); broadcastSync('goals', session.district); }
     return sendJson(res, 200, { ok: true });
   }
 
@@ -1233,6 +1449,7 @@ function createLogger() {
 function startServer(port = DEFAULT_PORT, attempt = 0) {
   return new Promise((resolve, reject) => {
     const server = http.createServer(serverHandler);
+    attachWebSocket(server);
 
     // Slow-loris va osilib qolgan so'rovlar himoyasi
     server.requestTimeout = REQUEST_TIMEOUT_MS;
@@ -1284,6 +1501,8 @@ if (require.main === module) {
       process.exit(1);
     }, 10000);
     forceExit.unref();
+
+    closeAllWebSockets(); // ochiq WS ulanishlar server.close() ni ushlab turmasin
 
     if (httpServer) {
       httpServer.close(() => {
