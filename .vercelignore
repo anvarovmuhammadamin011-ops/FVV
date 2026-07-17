@@ -1,0 +1,7 @@
+node_modules
+react-app/node_modules
+react-app/dist
+backend
+uploads
+.env
+.claude

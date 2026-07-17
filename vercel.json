@@ -1,0 +1,10 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "cd react-app && npm install && npm run build",
+  "outputDirectory": "react-app/dist",
+  "installCommand": "echo skip-root-install",
+  "rewrites": [
+    { "source": "/api/:path*", "destination": "http://157.180.46.214:8080/api/:path*" },
+    { "source": "/uploads/:path*", "destination": "http://157.180.46.214:8080/uploads/:path*" }
+  ]
+}

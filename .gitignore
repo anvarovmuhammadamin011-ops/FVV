@@ -1,0 +1,8 @@
+.vercel
+node_modules
+react-app/node_modules
+.env
+.env.local
+*.log
+backend/data.backup-*.json
+backend/data.json.*.tmp
